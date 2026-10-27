@@ -1,0 +1,87 @@
+max_pages_per_domain: 20
+request_timeout: 15
+request_delay_seconds: 1
+max_retries: 2
+user_agent: "NEAL-NGO-Enricher/1.0 (+https://example.local; respectful research bot)"
+enable_playwright: false
+enable_linkedin_discovery: true
+checkpoint_every: 10
+country_default: IN
+respect_robots_txt: true
+
+priority_link_keywords:
+  - contact
+  - contact-us
+  - about
+  - about-us
+  - team
+  - leadership
+  - who-we-are
+  - programs
+  - projects
+  - csr
+  - partners
+  - partnership
+  - impact
+  - education
+  - science
+  - stem
+  - schools
+  - teacher
+  - learning
+  - annual-report
+
+relevance_keywords:
+  stem: 30
+  steam: 30
+  science education: 30
+  science labs: 30
+  hands-on science: 30
+  school education: 25
+  teacher training: 20
+  government schools: 15
+  csr education: 15
+  digital learning: 10
+  hands-on learning: 10
+  experiential learning: 10
+  youth skill development: 5
+  k-12: 25
+
+role_keywords:
+  NGO:
+    - ngo
+    - foundation
+    - trust
+    - non-profit
+    - nonprofit
+  Implementation Partner:
+    - implementation
+    - program delivery
+    - projects
+    - schools
+    - community
+  CSR Partner:
+    - csr
+    - corporate social responsibility
+    - csr-1
+  Sponsor/Funder:
+    - grant
+    - funder
+    - donor
+    - sponsor
+  Training Partner:
+    - training
+    - teacher training
+    - capacity building
+  School Network:
+    - schools
+    - school network
+    - classrooms
+  Government Partner:
+    - government
+    - ministry
+    - municipal
+  Technology Partner:
+    - technology
+    - edtech
+    - digital learning

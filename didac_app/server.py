@@ -1,0 +1,695 @@
+from __future__ import annotations
+
+import os
+from datetime import UTC, datetime
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from twilio.twiml.messaging_response import MessagingResponse
+
+from didac_app.config import brochure_catalog, load_config
+from didac_app.intake import continue_intake, is_start_message, start_intake
+from didac_app.media import extract_media_text, save_twilio_media
+from didac_app.openai_services import split_lead_texts
+from didac_app.parser import parse_message, update_lead_from_note, update_lead_from_text
+from didac_app.replies import command_reply, lead_created_reply, media_reply
+from didac_app.scoring import enrich_lead
+from didac_app.storage import LeadStore
+
+app = Flask(__name__)
+config = load_config()
+store = LeadStore(config.database_path)
+
+
+@app.get("/")
+def home():
+    return render_template_string(DASHBOARD_HTML, **dashboard_context())
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "time": datetime.now(UTC).isoformat(timespec="seconds")}
+
+
+@app.get("/dashboard")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML, **dashboard_context())
+
+
+@app.get("/api/leads")
+def api_leads():
+    return jsonify([lead.__dict__ for lead in store.list_leads()])
+
+
+@app.get("/api/feedback")
+def api_feedback():
+    return jsonify([dict(row) for row in store.list_feedback()])
+
+
+@app.get("/api/media")
+def api_media():
+    return jsonify([dict(row) for row in store.list_media()])
+
+
+@app.get("/api/inbound")
+def api_inbound():
+    return jsonify([dict(row) for row in store.list_inbound_events()])
+
+
+@app.get("/brochures")
+def brochures():
+    return render_template_string(BROCHURES_HTML, brochures=brochure_catalog(config))
+
+
+@app.get("/brochure/<product_key>")
+def brochure_download(product_key: str):
+    for item in brochure_catalog(config).values():
+        if item["key"] == product_key:
+            if item["url"]:
+                return {"name": item["name"], "download_url": item["url"]}
+            return {"name": item["name"], "error": "Brochure URL not configured"}, 404
+    return {"error": "Unknown brochure"}, 404
+
+
+@app.get("/media/<int:media_id>")
+def media_file(media_id: int):
+    row = store.get_media(media_id)
+    if not row:
+        return {"error": "Media not found"}, 404
+    path = Path(row["local_path"] or "")
+    if not path.exists():
+        return {"error": "Local file not found"}, 404
+    return send_file(path)
+
+
+@app.get("/media-library")
+def media_library():
+    return render_template_string(MEDIA_LIBRARY_HTML, groups=media_library_groups())
+
+
+@app.get("/export/report")
+def export_report():
+    path = store.export_report_excel(config.export_dir / "didac_report.xlsx")
+    return send_file(Path(path).resolve(), as_attachment=True)
+
+
+@app.get("/export/report.xlsx")
+def export_report_xlsx():
+    path = store.export_report_excel(config.export_dir / "didac_report.xlsx")
+    return send_file(Path(path).resolve(), as_attachment=True)
+
+
+@app.get("/export/report.csv")
+def export_report_csv():
+    path = store.export_report_csv(config.export_dir / "didac_report.csv")
+    return send_file(Path(path).resolve(), as_attachment=True, mimetype="text/csv")
+
+
+@app.post("/twilio/whatsapp")
+def twilio_whatsapp():
+    form = request.form
+    from_number = form.get("From", "")
+    body = form.get("Body", "").strip()
+    num_media = int(form.get("NumMedia", "0") or 0)
+    media_urls_for_event = [form.get(f"MediaUrl{index}", "") for index in range(num_media) if form.get(f"MediaUrl{index}", "")]
+    event_id = store.add_inbound_event(from_number, body, num_media, media_urls_for_event, form.to_dict(flat=True))
+    touched_lead_ids = []
+    response = MessagingResponse()
+
+    if body.startswith("/"):
+        response.message(command_reply(body, store, config))
+        store.update_inbound_event(event_id, "processed_command")
+        return twiml(response)
+
+    latest = store.latest_lead_for_number(from_number)
+    if num_media:
+        context_lead = store.latest_lead_for_number(from_number)
+        is_feedback_media = bool(context_lead and context_lead.status == "Feedback:collect")
+        is_intake_media = bool(context_lead and context_lead.status.startswith("Intake:"))
+        process_count = min(num_media, config.max_media_per_message)
+        skipped_count = max(0, num_media - process_count)
+        extracted_texts = []
+        created_leads = []
+        media_urls = []
+        local_paths = []
+        applied_extracted_to_lead = False
+        for index in range(process_count):
+            media_url = form.get(f"MediaUrl{index}", "")
+            content_type = form.get(f"MediaContentType{index}", "")
+            if not media_url:
+                continue
+            local_path = download_media(media_url, content_type, from_number)
+            extracted = extract_media_text(local_path, content_type)
+            media_lead_texts = split_lead_texts(extracted) if extracted else []
+            should_create_media_leads = bool(
+                media_lead_texts and (content_type.startswith("image/") or len(media_lead_texts) > 1) and (not is_feedback_media or len(media_lead_texts) > 1)
+            )
+            if should_create_media_leads:
+                for lead_text in media_lead_texts:
+                    _, new_lead = parse_message("New lead\n" + lead_text, from_number)
+                    if body:
+                        apply_text_note(new_lead, body)
+                    new_lead.media_urls = media_url
+                    new_lead.media_local_paths = local_path
+                    new_lead = enrich_lead(new_lead, config)
+                    new_lead = store.create_lead(new_lead)
+                    touched_lead_ids.append(new_lead.id)
+                    media_id = store.add_media(new_lead.id, media_url, content_type, local_path, lead_text)
+                    if body:
+                        store.add_feedback(
+                            from_number,
+                            body,
+                            new_lead.id,
+                            feedback_type="text_caption",
+                            media_id=media_id,
+                            sentiment="",
+                            action_required="",
+                        )
+                    created_leads.append(new_lead)
+                    extracted_texts.append(lead_text)
+                media_urls.append(media_url)
+                local_paths.append(local_path)
+                continue
+
+            lead = context_lead
+            if not lead:
+                lead = enrich_lead(parse_message("New lead\nNotes: Media-only lead", from_number)[1], config)
+                lead = store.create_lead(lead)
+                touched_lead_ids.append(lead.id)
+                context_lead = lead
+            media_id = store.add_media(lead.id, media_url, content_type, local_path, extracted)
+            if is_feedback_media:
+                if body:
+                    apply_feedback_note(lead, body)
+                    store.add_feedback(
+                        from_number,
+                        body,
+                        lead.id,
+                        feedback_type="text_caption",
+                        media_id=media_id,
+                        sentiment="",
+                        action_required="",
+                    )
+                if extracted and "PENDING" not in extracted:
+                    apply_audio_or_media_note(lead, extracted, content_type)
+                    applied_extracted_to_lead = True
+                store.add_feedback(
+                    from_number,
+                    extracted or f"Media feedback saved: {content_type}",
+                    lead.id,
+                    feedback_type="audio" if content_type.startswith("audio/") else "media",
+                    media_id=media_id,
+                    sentiment="",
+                    action_required="review_media",
+                )
+            elif is_intake_media and extracted and "PENDING" not in extracted:
+                if body:
+                    apply_text_note(lead, body)
+                apply_audio_or_media_note(lead, extracted, content_type)
+                applied_extracted_to_lead = True
+                store.add_feedback(
+                    from_number,
+                    extracted,
+                    lead.id,
+                    feedback_type="audio_transcript" if content_type.startswith("audio/") else "media_text",
+                    media_id=media_id,
+                    sentiment="",
+                    action_required="",
+                )
+            elif extracted and "PENDING" not in extracted and content_type.startswith("audio/"):
+                if body:
+                    apply_text_note(lead, body)
+                apply_audio_or_media_note(lead, extracted, content_type)
+                applied_extracted_to_lead = True
+                store.add_feedback(
+                    from_number,
+                    extracted,
+                    lead.id,
+                    feedback_type="audio_transcript",
+                    media_id=media_id,
+                    sentiment="",
+                    action_required="",
+                )
+            media_urls.append(media_url)
+            local_paths.append(local_path)
+            if extracted:
+                extracted_texts.append(extracted)
+        if created_leads:
+            response.message(multi_card_media_reply(created_leads, process_count, skipped_count))
+        else:
+            lead = context_lead
+            if not lead:
+                lead = enrich_lead(parse_message("New lead\nNotes: Media-only lead", from_number)[1], config)
+                lead = store.create_lead(lead)
+                touched_lead_ids.append(lead.id)
+            lead.media_urls = merge_semicolon(lead.media_urls, *media_urls)
+            lead.media_local_paths = merge_semicolon(lead.media_local_paths, *local_paths)
+            if body:
+                apply_text_note(lead, body)
+                store.add_feedback(from_number, body, lead.id, feedback_type="text_caption")
+            if extracted_texts and not applied_extracted_to_lead and not all("PENDING" in item for item in extracted_texts):
+                if is_intake_media:
+                    apply_audio_or_media_note(lead, "\n".join(extracted_texts), "")
+                else:
+                    update_lead_from_text(lead, "\n".join(extracted_texts))
+            if lead.status == "Feedback:collect":
+                lead.status = "New"
+            if lead.status.startswith("Intake:"):
+                lead.status = "New"
+            lead = enrich_lead(lead, config)
+            store.update_lead(lead)
+            if lead.id:
+                touched_lead_ids.append(lead.id)
+            response.message(media_reply(lead, "\n".join(extracted_texts), process_count, skipped_count))
+        store.update_inbound_event(event_id, "processed", unique_ids(touched_lead_ids))
+    elif latest and latest.status.startswith(("Menu:", "Brochure:", "Feedback:", "Intake:", "Badge:")):
+        _, reply = continue_intake(latest, body, store, config)
+        response.message(reply)
+        if latest.id:
+            touched_lead_ids.append(latest.id)
+        store.update_inbound_event(event_id, "processed", unique_ids(touched_lead_ids))
+        return twiml(response)
+
+    elif is_start_message(body):
+        response.message(start_intake(from_number, store))
+        latest = store.latest_lead_for_number(from_number)
+        if latest and latest.id:
+            touched_lead_ids.append(latest.id)
+        store.update_inbound_event(event_id, "processed", unique_ids(touched_lead_ids))
+        return twiml(response)
+
+    else:
+        kind, lead = parse_message(body, from_number)
+        if lead:
+            lead = enrich_lead(lead, config)
+            lead = store.create_lead(lead)
+            touched_lead_ids.append(lead.id)
+            response.message(lead_created_reply(lead, config))
+        elif body:
+            lead = store.latest_lead_for_number(from_number)
+            if lead:
+                apply_text_note(lead, body)
+                store.add_feedback(from_number, body, lead.id, feedback_type="text_message")
+                lead = enrich_lead(lead, config)
+                store.update_lead(lead)
+                if lead.id:
+                    touched_lead_ids.append(lead.id)
+                response.message(lead_created_reply(lead, config))
+            else:
+                response.message("Send lead details starting with 'New lead', or send /help for the format.")
+        else:
+            response.message("Message received. Send /help for DIDAC lead commands.")
+        store.update_inbound_event(event_id, "processed", unique_ids(touched_lead_ids))
+    return twiml(response)
+
+
+def download_media(media_url: str, content_type: str, from_number: str = "") -> str:
+    sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    auth = (sid, token) if sid and token else None
+    return save_twilio_media(media_url, content_type, config.media_dir, auth, sender=from_number)
+
+
+def unique_ids(values):
+    seen = []
+    for value in values:
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def merge_semicolon(current: str, *values: str) -> str:
+    parts = [part for part in [current, *values] if part]
+    seen = []
+    for part in parts:
+        if part not in seen:
+            seen.append(part)
+    return "; ".join(seen)
+
+
+def apply_text_note(lead, text: str):
+    if not text:
+        return lead
+    lead.text_notes = merge_semicolon(lead.text_notes, text)
+    apply_capture_metadata(lead, text)
+    update_lead_from_note(lead, text)
+    return lead
+
+
+def apply_feedback_note(lead, text: str):
+    if not text:
+        return lead
+    lead.feedback_notes = merge_semicolon(lead.feedback_notes, text)
+    apply_capture_metadata(lead, text)
+    update_lead_from_note(lead, text)
+    return lead
+
+
+def apply_audio_or_media_note(lead, text: str, content_type: str):
+    if not text:
+        return lead
+    if content_type.startswith("audio/"):
+        lead.audio_transcript = merge_semicolon(lead.audio_transcript, text)
+    else:
+        lead.text_notes = merge_semicolon(lead.text_notes, text)
+    update_lead_from_note(lead, text)
+    return lead
+
+
+def apply_capture_metadata(lead, text: str):
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized = key.strip().lower()
+        value = value.strip()
+        if not value:
+            continue
+        if normalized in {"by", "captured by", "staff", "team member"}:
+            lead.captured_by = merge_semicolon(lead.captured_by, value)
+        elif normalized in {"context", "capture context", "event context"}:
+            lead.capture_context = merge_semicolon(lead.capture_context, value)
+        elif normalized in {"tag", "tags"}:
+            lead.tags = merge_semicolon(lead.tags, value)
+
+
+def twiml(response: MessagingResponse) -> Response:
+    return Response(str(response), mimetype="application/xml")
+
+
+def multi_card_media_reply(leads, processed_count: int, skipped_count: int) -> str:
+    lines = [f"Saved {len(leads)} lead record(s) from {processed_count} media file(s)."]
+    for lead in leads[:5]:
+        lines.append(f"#{lead.id}: {lead.org or lead.name or lead.phone or 'Unnamed lead'}")
+    if skipped_count:
+        lines.append(f"Skipped {skipped_count} extra file(s). Please send them separately.")
+    lines.append("Refresh the dashboard to see all records.")
+    return "\n".join(lines)
+
+
+def dashboard_context():
+    leads = store.list_leads()
+    feedback = store.list_feedback()
+    media = store.list_media()
+    inbound = store.list_inbound_events()
+    counts = store.count_by_priority()
+    staff_counts = {}
+    for lead in leads:
+        name = lead.captured_by or lead.staff_number or lead.from_number or "Unknown"
+        staff_counts[name] = staff_counts.get(name, 0) + 1
+    return {
+        "leads": leads[:50],
+        "feedback": feedback[:30],
+        "media": media[:30],
+        "inbound": inbound[:50],
+        "counts": counts,
+        "inbound_total": len(inbound),
+        "unprocessed_total": len([row for row in inbound if row["status"] == "received"]),
+        "staff_counts": staff_counts,
+        "total": len(leads),
+        "brochures": brochure_catalog(config),
+    }
+
+
+def media_library_groups():
+    groups = {}
+    for row in store.list_media():
+        path = Path(row["local_path"] or "")
+        try:
+            relative = path.relative_to(config.media_dir)
+            parts = relative.parts
+        except ValueError:
+            parts = path.parts
+        date = parts[0] if len(parts) >= 3 else "legacy"
+        sender = parts[1] if len(parts) >= 3 else "unknown_sender"
+        groups.setdefault(date, {}).setdefault(sender, []).append(row)
+    return groups
+
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Xperimentor DIDAC Dashboard</title>
+  <style>
+    :root { --ink: #17202a; --muted: #667085; --line: #d8dee6; --soft: #f5f7fa; --brand: #12343b; --blue: #0b6bcb; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: var(--soft); color: var(--ink); }
+    header { background: var(--brand); color: white; padding: 18px 28px; display: flex; justify-content: space-between; gap: 16px; align-items: center; flex-wrap: wrap; }
+    h1 { margin: 0; font-size: 22px; }
+    h2 { margin: 0 0 14px; font-size: 18px; }
+    main { padding: 18px 28px 42px; }
+    .muted { color: #a9b7c3; font-size: 13px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .button { display: inline-block; background: var(--blue); color: white; padding: 8px 11px; border-radius: 6px; text-decoration: none; font-size: 13px; }
+    .tabs { display: flex; gap: 6px; margin: 18px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+    .tab { border: 0; background: transparent; padding: 10px 13px; font-weight: 700; color: #475467; cursor: pointer; border-bottom: 3px solid transparent; white-space: nowrap; }
+    .tab.active { color: var(--blue); border-color: var(--blue); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat, .card { background: white; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+    .stat span { color: var(--muted); font-size: 13px; }
+    .stat strong { display: block; font-size: 28px; margin-top: 4px; }
+    .lead-cards { display: grid; gap: 10px; }
+    .lead-card { background: white; border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: grid; gap: 10px; }
+    .lead-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+    .lead-title { font-weight: 800; font-size: 15px; }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; background: #eef3f5; color: #344054; }
+    .pill.hot { background: #ffe8e1; color: #ad3307; }
+    .pill.warm { background: #fff2cc; color: #8a6100; }
+    .pill.nurture { background: #e8f4ff; color: #0b589c; }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 14px; font-size: 13px; }
+    .label { color: var(--muted); display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    .note { color: #344054; font-size: 13px; line-height: 1.4; white-space: pre-wrap; }
+    .wrap { max-width: 100%; overflow-x: auto; background: white; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: top; font-size: 13px; }
+    th { background: #eef3f5; font-weight: 800; position: sticky; top: 0; }
+    .team-list { display: grid; gap: 8px; }
+    .team-row { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid #edf0f3; padding: 8px 0; }
+    .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-top: 10px; }
+    .media-tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: white; min-height: 120px; }
+    .media-tile img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 6px; border: 1px solid #edf0f3; }
+    @media (max-width: 720px) { header, main { padding-left: 16px; padding-right: 16px; } .meta { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Xperimentor DIDAC Dashboard</h1>
+      <div class="muted">WhatsApp lead capture, badge scan, feedback, and media review</div>
+    </div>
+    <div class="actions">
+      <a class="button" href="/export/report.xlsx">Download XLSX</a>
+      <a class="button" href="/export/report.csv">Download CSV</a>
+      <a class="button" href="/brochures">Brochures</a>
+      <a class="button" href="/health">Health</a>
+    </div>
+  </header>
+  <main>
+    <nav class="tabs" aria-label="Dashboard tabs">
+      <button class="tab active" data-tab="summary">Summary</button>
+      <button class="tab" data-tab="leads">Leads</button>
+      <button class="tab" data-tab="feedback">Feedback</button>
+      <button class="tab" data-tab="media">Media</button>
+      <button class="tab" data-tab="library">Media Library</button>
+    </nav>
+
+    <section id="summary" class="panel active">
+      <h2>Summary</h2>
+      <div class="grid">
+        <div class="stat"><span>Total leads</span><strong>{{ total }}</strong></div>
+        <div class="stat"><span>Hot</span><strong>{{ counts.get('Hot', 0) }}</strong></div>
+        <div class="stat"><span>Warm</span><strong>{{ counts.get('Warm', 0) }}</strong></div>
+        <div class="stat"><span>Nurture</span><strong>{{ counts.get('Nurture', 0) }}</strong></div>
+        <div class="stat"><span>Inbound messages</span><strong>{{ inbound_total }}</strong></div>
+        <div class="stat"><span>Needs review</span><strong>{{ unprocessed_total }}</strong></div>
+      </div>
+      <div class="grid" style="margin-top: 12px;">
+        <div class="card">
+          <h2>Team Capture</h2>
+          <div class="team-list">
+            {% for name, count in staff_counts.items() %}
+            <div class="team-row"><span>{{ name }}</span><strong>{{ count }}</strong></div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Team Caption Format</h2>
+          <div class="note">By: Magesh
+Context: DIDAC Day 1 - Stall A12
+Tags: hot, distributor
+
+Then attach photo, badge, visiting card, form, or voice note.
+
+Media is stored as: data/didac_media/YYYY-MM-DD/whatsapp-number/...</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="leads" class="panel">
+      <h2>Leads</h2>
+      <div class="lead-cards">
+        {% for lead in leads %}
+        <article class="lead-card">
+          <div class="lead-head">
+            <div>
+              <div class="lead-title">#{{ lead.id }} {{ lead.org or lead.name or lead.phone or 'Unnamed lead' }}</div>
+              <div class="note">{{ lead.designation or lead.role }}{% if lead.city or lead.state %} · {{ lead.city or lead.state }}{% endif %}</div>
+            </div>
+            <span class="pill {{ lead.priority|lower|replace(' ', '-') }}">{{ lead.priority }}</span>
+          </div>
+          <div class="meta">
+            <div><span class="label">Contact</span>{{ lead.name or (lead.first_name ~ ' ' ~ lead.last_name) }}<br>{{ lead.phone }} {{ lead.email }}</div>
+            <div><span class="label">Interest</span>{{ lead.interest or '-' }}</div>
+            <div><span class="label">Owner / Next</span>{{ lead.owner }}<br>{{ lead.next_action }}</div>
+            <div><span class="label">Captured By</span>{{ lead.captured_by or lead.staff_number or lead.from_number }}<br>{{ lead.capture_context }}</div>
+            <div><span class="label">Tags</span>{{ lead.tags or '-' }}</div>
+            <div><span class="label">QR</span>{{ lead.qr_url or '-' }}</div>
+          </div>
+          {% if lead.text_notes or lead.audio_transcript or lead.feedback_notes %}
+          <div class="note">{{ lead.text_notes or lead.audio_transcript or lead.feedback_notes }}</div>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section id="feedback" class="panel">
+      <h2>Feedback</h2>
+      <div class="wrap"><table>
+        <tr><th>ID</th><th>When</th><th>From</th><th>Type</th><th>Feedback</th><th>Action</th></tr>
+        {% for item in feedback %}
+        <tr><td>{{ item['id'] }}</td><td>{{ item['created_at'] }}</td><td>{{ item['from_number'] }}</td><td>{{ item['feedback_type'] }}</td><td>{{ item['body'] }}</td><td>{{ item['action_required'] }}</td></tr>
+        {% endfor %}
+      </table></div>
+    </section>
+
+    <section id="media" class="panel">
+      <h2>Media</h2>
+      <div class="wrap"><table>
+        <tr><th>ID</th><th>Lead</th><th>Type</th><th>File</th><th>Extracted text</th></tr>
+        {% for item in media %}
+        <tr><td>{{ item['id'] }}</td><td>{{ item['lead_id'] }}</td><td>{{ item['content_type'] }}</td><td><a href="/media/{{ item['id'] }}">open</a></td><td>{{ item['extracted_text'] }}</td></tr>
+        {% endfor %}
+      </table></div>
+      <h2 style="margin-top: 18px;">Inbound Audit</h2>
+      <div class="wrap"><table>
+        <tr><th>ID</th><th>When</th><th>From</th><th>Media</th><th>Status</th><th>Leads</th><th>Body</th><th>Error</th></tr>
+        {% for item in inbound %}
+        <tr><td>{{ item['id'] }}</td><td>{{ item['created_at'] }}</td><td>{{ item['from_number'] }}</td><td>{{ item['num_media'] }}</td><td>{{ item['status'] }}</td><td>{{ item['lead_ids'] }}</td><td>{{ item['body'] }}</td><td>{{ item['error'] }}</td></tr>
+        {% endfor %}
+      </table></div>
+    </section>
+
+    <section id="library" class="panel">
+      <h2>Media Library</h2>
+      <div class="note">Browse saved media by event date and WhatsApp sender. Full page: <a href="/media-library">open media library</a></div>
+      <iframe src="/media-library" style="width:100%; min-height:680px; border:1px solid var(--line); border-radius:8px; background:white; margin-top:12px;"></iframe>
+    </section>
+  </main>
+  <script>
+    const tabs = document.querySelectorAll('.tab');
+    const panels = document.querySelectorAll('.panel');
+    function showTab(id) {
+      tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === id));
+      panels.forEach(panel => panel.classList.toggle('active', panel.id === id));
+      history.replaceState(null, '', '#' + id);
+    }
+    tabs.forEach(tab => tab.addEventListener('click', () => showTab(tab.dataset.tab)));
+    const initial = location.hash.replace('#', '');
+    if (initial && document.getElementById(initial)) showTab(initial);
+  </script>
+</body>
+</html>
+"""
+
+
+MEDIA_LIBRARY_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DIDAC Media Library</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 18px; background: #f5f7fa; color: #17202a; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    h2 { font-size: 16px; margin: 20px 0 8px; }
+    h3 { font-size: 14px; margin: 12px 0 8px; color: #475467; }
+    .group { background: white; border: 1px solid #d8dee6; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(155px, 1fr)); gap: 10px; }
+    .tile { border: 1px solid #edf0f3; border-radius: 8px; padding: 8px; background: #fff; }
+    .tile img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 6px; border: 1px solid #edf0f3; display: block; }
+    .meta { color: #667085; font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+    a { color: #0b6bcb; text-decoration: none; font-weight: 700; }
+    .empty { background: white; border: 1px solid #d8dee6; border-radius: 8px; padding: 16px; color: #667085; }
+  </style>
+</head>
+<body>
+  <h1>Media Library</h1>
+  {% if not groups %}
+    <div class="empty">No media uploaded yet.</div>
+  {% endif %}
+  {% for date, senders in groups.items() %}
+  <section class="group">
+    <h2>{{ date }}</h2>
+    {% for sender, items in senders.items() %}
+      <h3>{{ sender }} · {{ items|length }} file(s)</h3>
+      <div class="grid">
+      {% for item in items %}
+        <div class="tile">
+          {% if item['content_type'].startswith('image/') %}
+            <a href="/media/{{ item['id'] }}" target="_blank"><img src="/media/{{ item['id'] }}" alt="media {{ item['id'] }}"></a>
+          {% else %}
+            <a href="/media/{{ item['id'] }}" target="_blank">Open {{ item['content_type'] or 'file' }}</a>
+          {% endif %}
+          <div class="meta">Media #{{ item['id'] }} · Lead #{{ item['lead_id'] or '-' }}</div>
+          <div class="meta">{{ item['local_path'] }}</div>
+        </div>
+      {% endfor %}
+      </div>
+    {% endfor %}
+  </section>
+  {% endfor %}
+</body>
+</html>
+"""
+
+
+BROCHURES_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Xperimentor Brochures</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; margin: 0; padding: 28px; color: #17202a; }
+    .card { background: white; border: 1px solid #dde2e8; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    a { color: #0b6bcb; }
+  </style>
+</head>
+<body>
+  <h1>Xperimentor brochures</h1>
+  {% for number, item in brochures.items() %}
+  <div class="card">
+    <strong>{{ number }}. {{ item['name'] }}</strong><br>
+    {% if item['url'] %}
+      <a href="{{ item['url'] }}">Download / open brochure</a>
+    {% else %}
+      <span>URL not configured</span>
+    {% endif %}
+  </div>
+  {% endfor %}
+  <p><a href="/dashboard">Back to dashboard</a></p>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=True)
